@@ -23,7 +23,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import Range
 from vllm.logger import logger
 
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import add_rms_norm_bias_custom_op_available
 
 
 class AddRMSNormQuantPattern:
@@ -344,7 +344,7 @@ class AddRMSNormQuantFusionPass(VllmInductorPass):
                 self.pattern_match_passes)
             RMSNormDynamicQuantPattern(vllm_config, eps=eps).register(
                 self.pattern_match_passes)
-            if enable_custom_op():
+            if add_rms_norm_bias_custom_op_available():
                 AddRMSNormQuantPatternWithBias(vllm_config, eps=eps).register(
                     self.pattern_match_passes)
                 AddRMSNormQuantSPPatternWithBias(

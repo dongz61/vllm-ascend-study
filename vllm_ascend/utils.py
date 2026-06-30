@@ -18,6 +18,7 @@
 #
 
 import atexit
+import ctypes
 import functools
 import math
 import os
@@ -275,6 +276,34 @@ def enable_custom_op():
             "Warning: Failed to register custom ops, all custom ops will be disabled"
         )
     return _CUSTOM_OP_ENABLED
+
+
+@lru_cache(maxsize=1)
+def add_rms_norm_bias_custom_op_available() -> bool:
+    if not enable_custom_op():
+        return False
+
+    required_symbols = (
+        "aclnnAddRmsNormBias",
+        "aclnnAddRmsNormBiasGetWorkspaceSize",
+    )
+    try:
+        libopapi = ctypes.CDLL("libopapi.so")
+    except OSError as e:
+        logger.warning("Disable npu_add_rms_norm_bias custom op: %s", e)
+        return False
+
+    missing_symbols = [
+        symbol for symbol in required_symbols
+        if not hasattr(libopapi, symbol)
+    ]
+    if missing_symbols:
+        logger.warning(
+            "Disable npu_add_rms_norm_bias custom op: missing symbols %s",
+            missing_symbols)
+        return False
+
+    return True
 
 
 def find_hccl_library() -> str:
