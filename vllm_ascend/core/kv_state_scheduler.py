@@ -39,6 +39,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.kv_state_manager import KVStateManager
+from vllm_ascend.distributed.pd_trace import trace_event
 
 logger = init_logger(__name__)
 
@@ -122,6 +123,11 @@ class KVStateScheduler(Scheduler):
                 self.request_first_token[request.client_index] = {}
             self.request_first_token[request.client_index][
                 request.request_id] = new_token_id
+            trace_event("decode_request_added",
+                        request.request_id,
+                        role="decode",
+                        client_index=request.client_index,
+                        num_prompt_tokens=request.num_prompt_tokens)
         if self.is_mtp_kv_consumer:
             request.spec_token_ids = [0] * self.num_spec_tokens
         self.waiting.add_request(request)
@@ -754,6 +760,10 @@ class KVStateScheduler(Scheduler):
             request.num_computed_tokens = num_computed_tokens
 
         # Return that we are ready.
+        trace_event("decode_remote_kv_ready",
+                    request.request_id,
+                    role="decode",
+                    num_computed_tokens=request.num_computed_tokens)
         self.finished_recving_kv_req_ids.remove(request.request_id)
         return True
 
@@ -774,6 +784,12 @@ class KVStateScheduler(Scheduler):
                             engine_core_output.new_token_ids.insert(
                                 0, self.request_first_token[client_index][
                                     engine_core_output.request_id])
+                            trace_event("decode_first_token_out",
+                                        engine_core_output.request_id,
+                                        role="decode",
+                                        client_index=client_index,
+                                        num_new_tokens=len(
+                                            engine_core_output.new_token_ids))
                             self.request_first_token[client_index].pop(
                                 engine_core_output.request_id)
         return engine_core_outputs
@@ -843,6 +859,12 @@ class AsyncKVStateScheduler(AsyncScheduler, KVStateScheduler):
                             engine_core_output.new_token_ids.insert(
                                 0, self.request_first_token[client_index][
                                     engine_core_output.request_id])
+                            trace_event("decode_first_token_out",
+                                        engine_core_output.request_id,
+                                        role="decode",
+                                        client_index=client_index,
+                                        num_new_tokens=len(
+                                            engine_core_output.new_token_ids))
                             self.request_first_token[client_index].pop(
                                 engine_core_output.request_id)
         return engine_core_outputs

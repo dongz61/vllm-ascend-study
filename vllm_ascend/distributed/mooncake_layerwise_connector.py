@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.pd_trace import trace_event
 from vllm_ascend.distributed.utils import (align_memory,
                                            get_transfer_timeout_value,
                                            kv_alltoall_and_rearrange)
@@ -319,9 +320,28 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
+                trace_event("layerwise_transfer_start",
+                            role="prefill",
+                            request_ids=list(transfer_meta.req_ids),
+                            layer_idx=send_task.layer_idx,
+                            session_id=session_id,
+                            num_ops=len(transfer_meta.length),
+                            total_bytes=sum(transfer_meta.length))
+                transfer_start_time = time.perf_counter()
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst,
                     transfer_meta.length)
+                transfer_elapsed_ms = (
+                    time.perf_counter() - transfer_start_time) * 1000
+                trace_event("layerwise_transfer_end",
+                            role="prefill",
+                            request_ids=list(transfer_meta.req_ids),
+                            layer_idx=send_task.layer_idx,
+                            session_id=session_id,
+                            elapsed_ms=transfer_elapsed_ms,
+                            num_ops=len(transfer_meta.length),
+                            total_bytes=sum(transfer_meta.length),
+                            ret=ret)
                 if ret < 0:
                     logger.error(
                         f"Mooncake transfer failed for send requests {transfer_meta.req_ids} kv cache to {session_id}"
@@ -377,6 +397,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
             if self.task_tracker[req_id] == self.pd_head_ratio:
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
+                trace_event("layerwise_kv_recv_done",
+                            req_id,
+                            role="decode",
+                            pd_head_ratio=self.pd_head_ratio)
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -409,6 +433,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.debug("Got DONE_RECVING_MSG for request %s",
                                      msg[1])
                         request_id = msg[1]
+                        trace_event("layerwise_done_sending_recv",
+                                    request_id,
+                                    role="decode",
+                                    side_channel_port=self.side_channel_port)
                         self.update_task(request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
                     else:
@@ -641,6 +669,12 @@ class MooncakeLayerwiseConnectorScheduler:
                 request,
                 [],  #request._all_token_ids,
                 local_block_ids)
+            trace_event("layerwise_decode_alloc_remote_kv",
+                        request.request_id,
+                        role="decode",
+                        num_external_tokens=num_external_tokens,
+                        num_local_blocks=len(local_block_ids),
+                        metaserver=params.get("metaserver", None))
 
             params["do_remote_prefill"] = False
 
@@ -691,6 +725,13 @@ class MooncakeLayerwiseConnectorScheduler:
                 local_transferred_tokens=local_transferred_tokens,
                 local_computed_tokens=local_computed_tokens,
                 request=request)
+            trace_event("layerwise_prefill_scheduled",
+                        request.request_id,
+                        role="prefill",
+                        num_prompt_tokens=len(request.all_token_ids),
+                        num_local_blocks=len(local_block_ids),
+                        num_remote_blocks=len(remote_block_ids),
+                        remote_cache_tokens=remote_cache_tokens)
 
     def build_connector_meta(
         self,
@@ -764,6 +805,13 @@ class MooncakeLayerwiseConnectorScheduler:
                         logger.info(
                             f"MooncakeLayerwiseConnector scheduler add transfer task: {req_id=} {local_block_ids=} {remote_block_ids=} {local_trans_block_ids=} {remote_trans_block_ids=} local_computed_tokens={adjusted_tokens} request.all_token_ids={len(request.all_token_ids)}"
                         )
+                        trace_event("layerwise_transfer_task_built",
+                                    req_id,
+                                    role="prefill",
+                                    chunk_finish=chunk_finish,
+                                    local_computed_tokens=adjusted_tokens,
+                                    num_local_blocks=len(local_trans_block_ids),
+                                    num_remote_blocks=len(remote_trans_block_ids))
                         meta.add_new_req(
                             request_id=req_id,
                             local_block_ids=local_trans_block_ids,
@@ -780,6 +828,12 @@ class MooncakeLayerwiseConnectorScheduler:
                     # no chunk or last chunk
                     if send_req_info.local_computed_tokens >= len(
                             send_req_info.request.all_token_ids):
+                        trace_event("layerwise_prefill_finished",
+                                    req_id,
+                                    role="prefill",
+                                    num_prompt_tokens=len(
+                                        send_req_info.request.all_token_ids),
+                                    local_computed_tokens=send_req_info.local_computed_tokens)
                         send_req_info.update_computed_tokens(
                             send_req_info.local_computed_tokens +
                             self.block_size - 1)
@@ -1084,6 +1138,12 @@ class MooncakeLayerwiseConnectorWorker:
                 assert self.kv_recv_layer_thread is not None
                 with self.kv_recv_layer_thread.lock:
                     self.kv_recv_layer_thread.task_tracker[req_id] = 0
+                trace_event("layerwise_kv_load_start",
+                            req_id,
+                            role="decode",
+                            num_local_blocks=len(meta.local_block_ids),
+                            remote_host=meta.remote_host,
+                            remote_port=meta.remote_port)
 
     def save_kv_layer(self, layer_name: str, kv_layer: Tuple[torch.Tensor,
                                                              torch.Tensor],
@@ -1162,6 +1222,15 @@ class MooncakeLayerwiseConnectorWorker:
                             f"Add request {req_id} to kv send layer thread. {req_meta_update=}"
                         )
                         send_task.send_request[req_id] = req_meta_update
+                        trace_event("layerwise_layer_enqueue",
+                                    req_id,
+                                    role="prefill",
+                                    layer_idx=self.current_layer,
+                                    chunk_finish=req_meta_update.chunk_finish,
+                                    num_local_blocks=len(
+                                        req_meta_update.local_block_ids),
+                                    num_remote_blocks=len(
+                                        req_meta_update.remote_block_ids))
 
                 self.kv_send_layer_thread.send_queue.put(send_task)
             self.current_layer += 1
@@ -1238,6 +1307,11 @@ class MooncakeLayerwiseConnectorWorker:
     def send_done_send_signal(self, req_id, req_meta):
         logger.info("Sending done sending signal for request %s to %s:%d",
                     req_id, req_meta.remote_host, req_meta.remote_port)
+        trace_event("layerwise_done_sending_start",
+                    req_id,
+                    role="prefill",
+                    remote_host=req_meta.remote_host,
+                    remote_port=req_meta.remote_port)
         try:
             path = make_zmq_path("tcp", req_meta.remote_host,
                                  req_meta.remote_port)
@@ -1248,10 +1322,21 @@ class MooncakeLayerwiseConnectorWorker:
                 ack = sock.recv()
                 if ack != b"ACK":
                     raise ValueError(f"Unexpected ACK response: {ack}")
+                trace_event("layerwise_done_sending_ack",
+                            req_id,
+                            role="prefill",
+                            remote_host=req_meta.remote_host,
+                            remote_port=req_meta.remote_port)
         except Exception as e:
             logger.error(
                 f"Sending done sending signal for request {req_id} to {req_meta.remote_host}:{req_meta.remote_port} fail with error: {e}"
             )
+            trace_event("layerwise_done_sending_error",
+                        req_id,
+                        role="prefill",
+                        remote_host=req_meta.remote_host,
+                        remote_port=req_meta.remote_port,
+                        error=str(e))
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

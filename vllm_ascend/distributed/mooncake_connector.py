@@ -42,6 +42,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.pd_trace import trace_event
 from vllm_ascend.distributed.utils import get_transfer_timeout_value
 from vllm_ascend.utils import is_vl_model
 
@@ -426,19 +427,45 @@ class KVCacheRecvingThread(threading.Thread):
         try:
             logger.debug(
                 f"Starting to transfer KV cache for request {request_id}.")
+            trace_event("pull_transfer_task_start",
+                        request_id,
+                        role="decode",
+                        remote_host=remote_host,
+                        remote_port=remote_handshake_port,
+                        offset=req_meta.get("offset"),
+                        all_task_done=all_task_done)
             self._transfer_kv_cache(req_meta)
             logger.debug(
                 f"Finished transferring KV cache for request {request_id}.")
+            trace_event("pull_transfer_task_finish",
+                        request_id,
+                        role="decode",
+                        remote_host=remote_host,
+                        remote_port=remote_handshake_port,
+                        offset=req_meta.get("offset"),
+                        all_task_done=all_task_done)
         except Exception as e:
             logger.error(
                 "Failed to transfer KV cache for request "
                 f"{request_id}: {e}",
                 exc_info=True)
+            trace_event("pull_transfer_task_error",
+                        request_id,
+                        role="decode",
+                        remote_host=remote_host,
+                        remote_port=remote_handshake_port,
+                        offset=req_meta.get("offset"),
+                        error=str(e))
         finally:
             self._send_done_signal_to_free_remote_port(request_id, remote_host,
                                                        remote_port_send_num)
             if all_task_done:
                 self.task_tracker.update_done_task_count(request_id)
+                trace_event("pull_kv_recv_done",
+                            request_id,
+                            role="decode",
+                            remote_host=remote_host,
+                            remote_port=remote_handshake_port)
                 if request_id in self.proc_not_transfer_request:
                     del self.proc_not_transfer_request[request_id]
             self.request_queue.task_done()
@@ -480,6 +507,10 @@ class KVCacheRecvingThread(threading.Thread):
         # P worker that we have the blocks we need.
         num_local_blocks = len(local_block_ids)
         if num_local_blocks == 0:
+            trace_event("pull_transfer_skipped",
+                        request_id,
+                        role="decode",
+                        reason="no_local_blocks")
             return
 
         num_remote_blocks = len(remote_block_ids)
@@ -549,6 +580,18 @@ class KVCacheRecvingThread(threading.Thread):
                 dst_list.append(dst)
                 length_list.append(length)
 
+        trace_event("pull_transfer_start",
+                    request_id,
+                    role="decode",
+                    remote_host=remote_host,
+                    remote_port=remote_handshake_port,
+                    session_id=session_id,
+                    num_groups=num_transfer_groups,
+                    num_blocks=num_blocks,
+                    num_ops=len(length_list),
+                    total_bytes=sum(length_list),
+                    first_layer_index=first_layer_index,
+                    end_layer_index=end_layer_index)
         ret = self.engine.batch_transfer_sync_read(session_id, src_list,
                                                    dst_list, length_list)
         if ret < 0:
@@ -558,6 +601,18 @@ class KVCacheRecvingThread(threading.Thread):
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+        trace_event("pull_transfer_end",
+                    request_id,
+                    role="decode",
+                    remote_host=remote_host,
+                    remote_port=remote_handshake_port,
+                    session_id=session_id,
+                    elapsed_ms=req_transfer_elapsed,
+                    num_groups=num_transfer_groups,
+                    num_blocks=num_blocks,
+                    num_ops=len(length_list),
+                    total_bytes=sum(length_list),
+                    ret=ret)
         logger.info(
             "KV cache transfer for request %s took %.2f ms (%d groups,"
             " %d blocks). local_ip %s local_device_id %s remote_session_id %s",
@@ -996,6 +1051,17 @@ class MooncakeConnectorScheduler:
                                              "remote_port")):
                     local_block_ids = (blocks.get_unhashed_block_ids()
                                        if num_external_tokens > 0 else [])
+                    trace_event("pull_decode_alloc_remote_kv",
+                                request.request_id,
+                                role="decode",
+                                num_external_tokens=num_external_tokens,
+                                num_local_blocks=len(local_block_ids),
+                                num_remote_blocks=len(
+                                    params.get("remote_block_ids", [])),
+                                remote_engine_id=params.get(
+                                    "remote_engine_id"),
+                                remote_host=params.get("remote_host"),
+                                remote_port=params.get("remote_port"))
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (
                         request, local_block_ids, num_external_tokens)
@@ -1062,6 +1128,11 @@ class MooncakeConnectorScheduler:
             logger.info("Delaying free of %d blocks for request %s",
                         len(computed_block_ids), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
+            trace_event("pull_prefill_finished",
+                        request.request_id,
+                        role="prefill",
+                        num_prompt_tokens=len(request.prompt_token_ids),
+                        num_computed_blocks=len(computed_block_ids))
 
         num_prompt_blocks = math.ceil(
             len(request.prompt_token_ids) / self.block_size)
@@ -1573,6 +1644,15 @@ class MooncakeConnectorWorker:
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ", req_id,
                 meta.remote_engine_id, len(meta.local_block_ids),
                 len(meta.remote_block_ids))
+            trace_event("pull_kv_load_start",
+                        req_id,
+                        role="decode",
+                        remote_engine_id=meta.remote_engine_id,
+                        remote_host=meta.remote_host,
+                        remote_port=meta.remote_port,
+                        num_local_blocks=len(meta.local_block_ids),
+                        num_remote_blocks=len(meta.remote_block_ids),
+                        num_external_tokens=meta.num_external_tokens)
             if meta.remote_pcp_size * meta.remote_dcp_size > 1:
                 remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = self._get_kv_split_metadata(
                     req_id, meta)

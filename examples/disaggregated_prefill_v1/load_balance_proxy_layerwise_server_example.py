@@ -99,6 +99,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from vllm.logger import init_logger
+from vllm_ascend.distributed.pd_trace import trace_event
 
 logger = init_logger(__name__)
 
@@ -374,10 +375,23 @@ async def send_request_to_service(client: httpx.AsyncClient,
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
+            trace_event("proxy_prefill_request_start",
+                        request_id,
+                        role="proxy",
+                        endpoint=endpoint,
+                        prefiller_id=prefiller_id,
+                        mode="layerwise")
             response = await client.post(endpoint,
                                          json=req_data,
                                          headers=headers)
             response.raise_for_status()
+            trace_event("proxy_prefill_request_end",
+                        request_id,
+                        role="proxy",
+                        endpoint=endpoint,
+                        prefiller_id=prefiller_id,
+                        status_code=response.status_code,
+                        mode="layerwise")
             if request_id in proxy_state.req_id_future:
                 result_future = proxy_state.req_id_future[request_id]
                 result_future.set_result(response.json()["kv_transfer_params"])
@@ -406,6 +420,11 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
     }
     for attempt in range(1, max_retries + 1):
         try:
+            trace_event("proxy_decode_request_start",
+                        request_id,
+                        role="proxy",
+                        endpoint=endpoint,
+                        mode="layerwise")
             async with client.stream("POST",
                                      endpoint,
                                      json=req_data,
@@ -413,8 +432,21 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
                 response.raise_for_status()
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
+                    if not first_chunk_sent:
+                        trace_event("proxy_first_response_chunk",
+                                    request_id,
+                                    role="proxy",
+                                    endpoint=endpoint,
+                                    status_code=response.status_code,
+                                    mode="layerwise")
                     first_chunk_sent = True
                     yield chunk
+                trace_event("proxy_decode_request_end",
+                            request_id,
+                            role="proxy",
+                            endpoint=endpoint,
+                            status_code=response.status_code,
+                            mode="layerwise")
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
@@ -467,6 +499,12 @@ async def _handle_completions(api: str, request: Request):
         req_body = await request.body()
         request_length = len(req_body)
         request_id = await proxy_state.next_req_id()
+        trace_event("proxy_request_received",
+                    request_id,
+                    role="proxy",
+                    api=api,
+                    request_length=request_length,
+                    mode="layerwise")
         request_id_api = get_api_request_id(api, request_id)
         proxy_state.req_data_dict[request_id_api] = (req_data, request_length,
                                                      api)
@@ -484,6 +522,13 @@ async def _handle_completions(api: str, request: Request):
         # Use the prefiller's kv_transfer_params to select decoder
         decoder_idx = proxy_state.select_decoder(decoder_score)
         decoder = proxy_state.decoders[decoder_idx]
+        trace_event("proxy_decoder_selected",
+                    request_id,
+                    role="proxy",
+                    decoder_idx=decoder_idx,
+                    decoder=str(decoder),
+                    decoder_score=decoder_score,
+                    mode="layerwise")
         # logger.debug("Using %s %s", prefiller.url, decoder.url)
         # Stream response from decoder
         released_kv = False
@@ -547,6 +592,12 @@ async def metaserver(request: Request):
         kv_transfer_params = await request.json()
 
         request_id = kv_transfer_params["request_id"]
+        trace_event("proxy_metaserver_received",
+                    request_id,
+                    role="proxy",
+                    mode="layerwise",
+                    num_remote_blocks=len(
+                        kv_transfer_params.get("remote_block_ids", [])))
         assert request_id in proxy_state.req_data_dict
         req_data, request_length, api = proxy_state.req_data_dict[request_id]
         request_id = get_origin_request_id(api, request_id)
@@ -559,6 +610,13 @@ async def metaserver(request: Request):
         # Select prefiller
         prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
+        trace_event("proxy_prefiller_selected",
+                    request_id,
+                    role="proxy",
+                    prefiller_idx=prefiller_idx,
+                    prefiller=str(prefiller),
+                    prefiller_score=prefiller_score,
+                    mode="layerwise")
         logger.debug(f"Using prefill {prefiller.url=} {req_data=}")
         # Send request to prefiller
         response = await send_request_to_service(

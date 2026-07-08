@@ -131,6 +131,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from vllm.logger import init_logger
+from vllm_ascend.distributed.pd_trace import trace_event
 
 logger = init_logger(__name__)
 
@@ -560,10 +561,21 @@ async def send_request_to_service(client: httpx.AsyncClient,
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
+            trace_event("proxy_prefill_request_start",
+                        request_id,
+                        role="proxy",
+                        endpoint=endpoint,
+                        prefiller_id=prefiller_id)
             response = await client.post(endpoint,
                                          json=req_data,
                                          headers=headers)
             response.raise_for_status()
+            trace_event("proxy_prefill_request_end",
+                        request_id,
+                        role="proxy",
+                        endpoint=endpoint,
+                        prefiller_id=prefiller_id,
+                        status_code=response.status_code)
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             logger.warning(
@@ -589,6 +601,10 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
     }
     for attempt in range(1, max_retries + 1):
         try:
+            trace_event("proxy_decode_request_start",
+                        request_id,
+                        role="proxy",
+                        endpoint=endpoint)
             async with client.stream("POST",
                                      endpoint,
                                      json=req_data,
@@ -596,8 +612,19 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
                 response.raise_for_status()
                 first_chunk_sent = False
                 async for chunk in response.aiter_bytes():
+                    if not first_chunk_sent:
+                        trace_event("proxy_first_response_chunk",
+                                    request_id,
+                                    role="proxy",
+                                    endpoint=endpoint,
+                                    status_code=response.status_code)
                     first_chunk_sent = True
                     yield chunk
+                trace_event("proxy_decode_request_end",
+                            request_id,
+                            role="proxy",
+                            endpoint=endpoint,
+                            status_code=response.status_code)
                 return  # Success, exit after streaming
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt < max_retries:
@@ -637,9 +664,21 @@ async def _handle_select_instance(api: str, req_data: Any,
         f"Request length: {request_length}, Prefiller score: {prefiller_score}"
     )
     request_id = await proxy_state.next_req_id()
+    trace_event("proxy_request_received",
+                request_id,
+                role="proxy",
+                api=api,
+                request_length=request_length,
+                mode="pull")
     # Select prefiller
     prefiller_idx = proxy_state.select_prefiller(prefiller_score)
     prefiller = proxy_state.prefillers[prefiller_idx]
+    trace_event("proxy_prefiller_selected",
+                request_id,
+                role="proxy",
+                prefiller_idx=prefiller_idx,
+                prefiller=str(prefiller),
+                prefiller_score=prefiller_score)
     # Send request to prefiller
     response = await send_request_to_service(
         prefiller.client,
@@ -660,6 +699,12 @@ async def _handle_select_instance(api: str, req_data: Any,
     # Use the prefiller's kv_transfer_params to select decoder
     decoder_idx = proxy_state.select_decoder(decoder_score)
     decoder = proxy_state.decoders[decoder_idx]
+    trace_event("proxy_decoder_selected",
+                request_id,
+                role="proxy",
+                decoder_idx=decoder_idx,
+                decoder=str(decoder),
+                decoder_score=decoder_score)
     logger.debug("Using %s %s", prefiller.url, decoder.url)
     return InstanceInfo(request_id=request_id,
                         prefiller_idx=prefiller_idx,
