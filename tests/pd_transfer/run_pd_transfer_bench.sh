@@ -61,6 +61,23 @@ wait_for_proxy() {
   done
 }
 
+write_case_event() {
+  local case_dir=$1
+  local event=$2
+  local case_id=$3
+  local mode=$4
+  local input_len=$5
+  local output_len=$6
+  local concurrency=$7
+  local num_prompts=$8
+  local ts_ns
+  ts_ns=$(date +%s%N)
+
+  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"%s","input_len":%s,"output_len":%s,"concurrency":%s,"num_prompts":%s}\n' \
+    "${ts_ns}" "${event}" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" \
+    >> "${case_dir}/case.trace.jsonl"
+}
+
 kv_config() {
   local connector=$1
   local module_path=$2
@@ -163,10 +180,12 @@ run_benchmark_case() {
   local output_len=$4
   local concurrency=$5
   local num_prompts=$((concurrency * NUM_FOLDS))
+  local case_id="${mode}-input-${input_len}-output-${output_len}-concurrency-${concurrency}"
   local result_name="${mode}-input-${input_len}-output-${output_len}-concurrency-${concurrency}.json"
   local bench_log="${case_dir}/bench-input-${input_len}-output-${output_len}-concurrency-${concurrency}.log"
 
   echo "Benchmark ${mode}: input=${input_len}, output=${output_len}, concurrency=${concurrency}, prompts=${num_prompts}"
+  write_case_event "${case_dir}" "bench_case_start" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}"
   vllm bench serve \
     --backend vllm \
     --model "${SERVED_MODEL_NAME}" \
@@ -183,6 +202,7 @@ run_benchmark_case() {
     --result-dir "${case_dir}" \
     --result-filename "${result_name}" \
     ${BENCH_EXTRA_ARGS} 2>&1 | tee "${bench_log}"
+  write_case_event "${case_dir}" "bench_case_end" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}"
 }
 
 run_mode() {
