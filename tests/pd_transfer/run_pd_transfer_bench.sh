@@ -112,6 +112,7 @@ start_vllm_server() {
     export VLLM_ASCEND_PD_TRACE_PATH="${trace_file}"
     export VLLM_ASCEND_PD_TRACE_ROLE="${role}"
     export HCCL_EXEC_TIMEOUT HCCL_CONNECT_TIMEOUT TASK_QUEUE_ENABLE VLLM_USE_V1
+    export TRANSFORMERS_OFFLINE HF_HUB_OFFLINE
     vllm serve "${MODEL}" \
       --host "0.0.0.0" \
       --port "${port}" \
@@ -169,6 +170,7 @@ run_benchmark_case() {
   vllm bench serve \
     --backend vllm \
     --model "${SERVED_MODEL_NAME}" \
+    --tokenizer "${BENCH_TOKENIZER:-${MODEL}}" \
     --host "${HOST}" \
     --port "${PROXY_PORT}" \
     --dataset-name random \
