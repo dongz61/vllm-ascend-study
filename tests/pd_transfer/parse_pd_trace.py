@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import os
 import re
 import statistics
 from collections import defaultdict
@@ -46,11 +47,14 @@ LAST_EVENTS = {
 
 REQUEST_ID_PREFIX_RE = re.compile(r"^cmpl-")
 REQUEST_ID_SUFFIX_RE = re.compile(r"-\d+$")
+BENCH_RESULT_RE = re.compile(
+    r"(?P<mode>pull|layerwise)-input-(?P<input_len>\d+)-output-"
+    r"(?P<output_len>\d+)-concurrency-(?P<concurrency>\d+)\.json$")
 
 
 def iter_trace_records(root: Path):
     for path in root.rglob("*.trace.jsonl"):
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -87,6 +91,153 @@ def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, int(round((pct / 100) * (len(ordered) - 1))))
     return ordered[idx]
+
+
+def as_float(value: Any) -> float | str:
+    if value is None or value == "":
+        return ""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return ""
+
+
+def nested_percentile(data: dict[str, Any], metric: str,
+                      pct: int) -> float | str:
+    candidates = [
+        f"percentiles_{metric}_ms",
+        f"{metric}_percentiles_ms",
+        f"{metric}_percentiles",
+        f"percentiles_{metric}",
+    ]
+    for key in candidates:
+        value = data.get(key)
+        if isinstance(value, dict):
+            for pct_key in (str(pct), f"p{pct}", f"P{pct}", float(pct), pct):
+                if pct_key in value:
+                    return as_float(value[pct_key])
+    return ""
+
+
+def metric_value(data: dict[str, Any], *keys: str) -> float | str:
+    for key in keys:
+        value = as_float(data.get(key))
+        if value != "":
+            return value
+    return ""
+
+
+def percentile_metric(data: dict[str, Any], metric: str,
+                      pct: int) -> float | str:
+    direct = metric_value(data, f"p{pct}_{metric}_ms",
+                          f"P{pct}_{metric}_ms", f"{metric}_p{pct}_ms",
+                          f"{metric}_P{pct}_ms")
+    if direct != "":
+        return direct
+    return nested_percentile(data, metric, pct)
+
+
+def parse_benchmark_results(root: Path, ttft_p99_slo_ms: float,
+                            tpot_p99_slo_ms: float) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in root.rglob("*.json"):
+        match = BENCH_RESULT_RE.search(path.name)
+        if match is None:
+            continue
+        with path.open("r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+
+        row: dict[str, Any] = {
+            "case_id":
+            path.stem,
+            "mode":
+            match.group("mode"),
+            "input_len":
+            int(match.group("input_len")),
+            "output_len":
+            int(match.group("output_len")),
+            "concurrency":
+            int(match.group("concurrency")),
+            "result_file":
+            str(path),
+            "completed":
+            data.get("completed", data.get("num_completed_requests", "")),
+            "request_throughput":
+            metric_value(data, "request_throughput", "requests_per_second"),
+            "input_throughput":
+            metric_value(data, "input_throughput"),
+            "output_throughput":
+            metric_value(data, "output_throughput"),
+            "total_token_throughput":
+            metric_value(data, "total_token_throughput",
+                         "total_tokens_per_second", "tokens_per_second"),
+            "mean_ttft_ms":
+            metric_value(data, "mean_ttft_ms"),
+            "median_ttft_ms":
+            metric_value(data, "median_ttft_ms"),
+            "p99_ttft_ms":
+            percentile_metric(data, "ttft", 99),
+            "mean_tpot_ms":
+            metric_value(data, "mean_tpot_ms"),
+            "median_tpot_ms":
+            metric_value(data, "median_tpot_ms"),
+            "p99_tpot_ms":
+            percentile_metric(data, "tpot", 99),
+            "mean_itl_ms":
+            metric_value(data, "mean_itl_ms"),
+            "median_itl_ms":
+            metric_value(data, "median_itl_ms"),
+            "p99_itl_ms":
+            percentile_metric(data, "itl", 99),
+            "mean_e2el_ms":
+            metric_value(data, "mean_e2el_ms"),
+            "median_e2el_ms":
+            metric_value(data, "median_e2el_ms"),
+            "p99_e2el_ms":
+            percentile_metric(data, "e2el", 99),
+        }
+
+        ttft = row["p99_ttft_ms"]
+        tpot = row["p99_tpot_ms"]
+        ttft_ok = ttft == "" or ttft_p99_slo_ms <= 0 or ttft <= ttft_p99_slo_ms
+        tpot_ok = tpot == "" or tpot_p99_slo_ms <= 0 or tpot <= tpot_p99_slo_ms
+        row["ttft_p99_slo_ms"] = ttft_p99_slo_ms
+        row["tpot_p99_slo_ms"] = tpot_p99_slo_ms
+        row["slo_met"] = bool(ttft_ok and tpot_ok)
+        row["goodput_request_throughput"] = (
+            row["request_throughput"] if row["slo_met"] else 0.0)
+        row["goodput_output_throughput"] = (
+            row["output_throughput"] if row["slo_met"] else 0.0)
+        rows.append(row)
+
+    rows.sort(key=lambda row: (str(row["mode"]), int(row["input_len"]),
+                               int(row["output_len"]),
+                               int(row["concurrency"])))
+    return rows
+
+
+def summarize_goodput(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["mode"], row["input_len"], row["output_len"])].append(row)
+
+    result = []
+    for key, items in sorted(grouped.items()):
+        best = max(items,
+                   key=lambda item: float(item["goodput_output_throughput"]
+                                          or 0.0))
+        result.append({
+            "mode": key[0],
+            "input_len": key[1],
+            "output_len": key[2],
+            "best_concurrency": best["concurrency"],
+            "slo_met": best["slo_met"],
+            "goodput_output_throughput": best["goodput_output_throughput"],
+            "goodput_request_throughput": best["goodput_request_throughput"],
+            "p99_ttft_ms": best["p99_ttft_ms"],
+            "p99_tpot_ms": best["p99_tpot_ms"],
+        })
+    return result
 
 
 def find_cases(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -274,6 +425,63 @@ def aggregate_pull(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def aggregate_npu_util(records: list[dict[str, Any]],
+                       cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for record in records:
+        if record.get("event") != "npu_util_sample":
+            continue
+        util = as_float(record.get("util_percent"))
+        if util == "":
+            continue
+        case = case_for_ts(cases, int(record.get("ts_ns", 0)))
+        if case is None:
+            continue
+        role = str(record.get("role", ""))
+        device = str(record.get("device", ""))
+        grouped[(case["case_id"], case["mode"], case["input_len"],
+                 case["output_len"], case["concurrency"], role,
+                 device)].append(float(util))
+
+    by_case_role: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    for key, values in grouped.items():
+        case_key = key[:5]
+        role = key[5]
+        by_case_role[(*case_key, role)].extend(values)
+
+    case_keys = sorted({key[:5] for key in by_case_role})
+    result = []
+    for case_key in case_keys:
+        prefill_values = by_case_role.get((*case_key, "prefill_util"), [])
+        decode_values = by_case_role.get((*case_key, "decode_util"), [])
+        prefill_mean = (round(statistics.mean(prefill_values), 3)
+                        if prefill_values else "")
+        decode_mean = (round(statistics.mean(decode_values), 3)
+                       if decode_values else "")
+        balance_gap = ""
+        decode_to_prefill_ratio = ""
+        if prefill_mean != "" and decode_mean != "":
+            balance_gap = round(abs(float(prefill_mean) - float(decode_mean)),
+                                3)
+            decode_to_prefill_ratio = (
+                round(float(decode_mean) / float(prefill_mean), 3)
+                if float(prefill_mean) > 0 else "")
+        result.append({
+            "case_id": case_key[0],
+            "mode": case_key[1],
+            "input_len": case_key[2],
+            "output_len": case_key[3],
+            "concurrency": case_key[4],
+            "prefill_util_mean": prefill_mean,
+            "decode_util_mean": decode_mean,
+            "util_balance_gap": balance_gap,
+            "decode_to_prefill_util_ratio": decode_to_prefill_ratio,
+            "prefill_sample_count": len(prefill_values),
+            "decode_sample_count": len(decode_values),
+        })
+    return result
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -281,8 +489,55 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
         writer.writerows(rows)
 
 
-def write_markdown(path: Path, pull_rows: list[dict[str, Any]]) -> None:
+def write_markdown(path: Path, pull_rows: list[dict[str, Any]],
+                   serve_rows: list[dict[str, Any]],
+                   goodput_rows: list[dict[str, Any]],
+                   util_rows: list[dict[str, Any]]) -> None:
     lines = ["# PD Transfer Trace Report", ""]
+    if serve_rows:
+        lines.extend([
+            "## Serve-Level Metrics",
+            "",
+            "| case | req/s | output tok/s | TTFT P99 ms | TPOT P99 ms | SLO met | goodput output tok/s |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in serve_rows:
+            lines.append(
+                f"| {row['case_id']} | {row['request_throughput']} | "
+                f"{row['output_throughput']} | {row['p99_ttft_ms']} | "
+                f"{row['p99_tpot_ms']} | {row['slo_met']} | "
+                f"{row['goodput_output_throughput']} |")
+        lines.append("")
+
+    if goodput_rows:
+        lines.extend([
+            "## Best Goodput Under SLO",
+            "",
+            "| mode | input | output | best concurrency | goodput output tok/s | TTFT P99 ms | TPOT P99 ms |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in goodput_rows:
+            lines.append(
+                f"| {row['mode']} | {row['input_len']} | "
+                f"{row['output_len']} | {row['best_concurrency']} | "
+                f"{row['goodput_output_throughput']} | "
+                f"{row['p99_ttft_ms']} | {row['p99_tpot_ms']} |")
+        lines.append("")
+
+    if util_rows:
+        lines.extend([
+            "## P/D Utilization Balance",
+            "",
+            "| case | P util mean | D util mean | abs gap | D/P ratio |",
+            "|---|---:|---:|---:|---:|",
+        ])
+        for row in util_rows:
+            lines.append(
+                f"| {row['case_id']} | {row['prefill_util_mean']} | "
+                f"{row['decode_util_mean']} | {row['util_balance_gap']} | "
+                f"{row['decode_to_prefill_util_ratio']} |")
+        lines.append("")
+
     if not pull_rows:
         lines.extend([
             "No pull transfer events were found.",
@@ -312,12 +567,22 @@ def write_markdown(path: Path, pull_rows: list[dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_root", type=Path)
+    parser.add_argument("--ttft-p99-slo-ms",
+                        type=float,
+                        default=float(os.getenv("TTFT_P99_SLO_MS", "0")))
+    parser.add_argument("--tpot-p99-slo-ms",
+                        type=float,
+                        default=float(os.getenv("TPOT_P99_SLO_MS", "0")))
     args = parser.parse_args()
 
     records = list(iter_trace_records(args.run_root))
     cases = find_cases(records)
     request_rows = build_request_rows(records, cases)
     pull_rows = aggregate_pull(request_rows)
+    serve_rows = parse_benchmark_results(args.run_root, args.ttft_p99_slo_ms,
+                                         args.tpot_p99_slo_ms)
+    goodput_rows = summarize_goodput(serve_rows)
+    util_rows = aggregate_npu_util(records, cases)
 
     request_fields = [
         "case_id", "mode", "input_len", "output_len", "concurrency",
@@ -339,17 +604,48 @@ def main() -> None:
         "prefill_to_decode_request_added_mean_ms",
         "prefill_to_transfer_start_mean_ms", "visible_tail_mean_ms",
     ]
+    serve_fields = [
+        "case_id", "mode", "input_len", "output_len", "concurrency",
+        "completed", "request_throughput", "input_throughput",
+        "output_throughput", "total_token_throughput", "mean_ttft_ms",
+        "median_ttft_ms", "p99_ttft_ms", "mean_tpot_ms",
+        "median_tpot_ms", "p99_tpot_ms", "mean_itl_ms", "median_itl_ms",
+        "p99_itl_ms", "mean_e2el_ms", "median_e2el_ms", "p99_e2el_ms",
+        "ttft_p99_slo_ms", "tpot_p99_slo_ms", "slo_met",
+        "goodput_request_throughput", "goodput_output_throughput",
+        "result_file",
+    ]
+    goodput_fields = [
+        "mode", "input_len", "output_len", "best_concurrency", "slo_met",
+        "goodput_output_throughput", "goodput_request_throughput",
+        "p99_ttft_ms", "p99_tpot_ms",
+    ]
+    util_fields = [
+        "case_id", "mode", "input_len", "output_len", "concurrency",
+        "prefill_util_mean", "decode_util_mean", "util_balance_gap",
+        "decode_to_prefill_util_ratio", "prefill_sample_count",
+        "decode_sample_count",
+    ]
 
     request_csv = args.run_root / "pd_request_timeline_ms.csv"
     pull_csv = args.run_root / "pull_transfer_summary.csv"
+    serve_csv = args.run_root / "serve_summary.csv"
+    goodput_csv = args.run_root / "goodput_summary.csv"
+    util_csv = args.run_root / "npu_util_summary.csv"
     report_md = args.run_root / "pd_trace_report.md"
 
     write_csv(request_csv, request_rows, request_fields)
     write_csv(pull_csv, pull_rows, pull_fields)
-    write_markdown(report_md, pull_rows)
+    write_csv(serve_csv, serve_rows, serve_fields)
+    write_csv(goodput_csv, goodput_rows, goodput_fields)
+    write_csv(util_csv, util_rows, util_fields)
+    write_markdown(report_md, pull_rows, serve_rows, goodput_rows, util_rows)
 
     print(f"Wrote request timeline: {request_csv}")
     print(f"Wrote pull transfer summary: {pull_csv}")
+    print(f"Wrote serve summary: {serve_csv}")
+    print(f"Wrote goodput summary: {goodput_csv}")
+    print(f"Wrote NPU utilization summary: {util_csv}")
     print(f"Wrote markdown report: {report_md}")
     if not cases:
         print("No bench_case_start/end markers found; per-case grouping is only "

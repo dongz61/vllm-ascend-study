@@ -78,6 +78,71 @@ write_case_event() {
     >> "${case_dir}/case.trace.jsonl"
 }
 
+start_npu_util_sampler() {
+  local role=$1
+  local devices_csv=$2
+  local trace_file=$3
+
+  if [[ "${ENABLE_NPU_UTIL_SAMPLING:-0}" != "1" ]]; then
+    return
+  fi
+  if ! command -v npu-smi >/dev/null 2>&1; then
+    echo "npu-smi not found; skip ${role} utilization sampling" >&2
+    return
+  fi
+
+  (
+    IFS=',' read -r -a devices <<< "${devices_csv}"
+    while true; do
+      for device in "${devices[@]}"; do
+        device="${device// /}"
+        if [[ -z "${device}" ]]; then
+          continue
+        fi
+        raw="$(npu-smi info -t usages -i "${device}" 2>&1 || true)"
+        RAW_NPU_SMI_OUTPUT="${raw}" python - "${trace_file}" "${role}" "${device}" <<'PY'
+import json
+import os
+import re
+import socket
+import sys
+import time
+
+path, role, device = sys.argv[1:4]
+raw = os.environ.get("RAW_NPU_SMI_OUTPUT", "")
+patterns = [
+    r"(?:AICore|AI\s*Core|NPU|Device).{0,60}?(?:Utilization|Usage|Rate).{0,30}?([0-9]+(?:\.[0-9]+)?)\s*%?",
+    r"(?:Utilization|Usage|Rate).{0,60}?(?:AICore|AI\s*Core|NPU|Device).{0,30}?([0-9]+(?:\.[0-9]+)?)\s*%?",
+    r"\|\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*\|",
+]
+util = None
+for pattern in patterns:
+    match = re.search(pattern, raw, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        util = float(match.group(1))
+        break
+record = {
+    "ts_ns": time.time_ns(),
+    "perf_ns": time.perf_counter_ns(),
+    "pid": os.getpid(),
+    "host": socket.gethostname(),
+    "role": role,
+    "event": "npu_util_sample",
+    "device": device,
+    "util_percent": util,
+    "raw": raw,
+}
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(record, ensure_ascii=False))
+    f.write("\n")
+PY
+      done
+      sleep "${NPU_UTIL_SAMPLE_INTERVAL_SEC:-1}"
+    done
+  ) &
+  PIDS+=("$!")
+}
+
 kv_config() {
   local connector=$1
   local module_path=$2
@@ -219,6 +284,8 @@ run_mode() {
 
   start_proxy "${mode}" "${mode_dir}/proxy.trace.jsonl" "${mode_dir}/proxy.log"
   wait_for_proxy
+  start_npu_util_sampler "prefill_util" "${PREFILL_DEVICES}" "${mode_dir}/npu_util.trace.jsonl"
+  start_npu_util_sampler "decode_util" "${DECODE_DEVICES}" "${mode_dir}/npu_util.trace.jsonl"
 
   for input_len in ${INPUT_LENS}; do
     for output_len in ${OUTPUT_LENS}; do

@@ -10,7 +10,8 @@ The first version targets a 1P1D setup:
 3. Start the matching PD proxy.
 4. Run random-input serving benchmarks for selected input/output lengths and
    concurrency levels.
-5. Save vLLM benchmark JSON, process logs, and PD trace JSONL files.
+5. Save vLLM benchmark JSON, process logs, PD trace JSONL files, and optional
+   NPU utilization samples.
 
 Tracing is disabled by default in the codebase. These scripts enable it by
 setting:
@@ -32,8 +33,24 @@ bash tests/pd_transfer/run_pd_transfer_bench.sh tests/pd_transfer/config.env
 After a run, parse trace files:
 
 ```bash
-python tests/pd_transfer/parse_pd_trace.py results/pd_transfer/<run-dir>
+python tests/pd_transfer/parse_pd_trace.py results/pd_transfer/<run-dir> \
+  --ttft-p99-slo-ms 1000 \
+  --tpot-p99-slo-ms 50
 ```
 
-The parser produces `pd_trace_summary.csv` with per-request event timestamps and
-basic derived durations.
+The parser produces:
+
+- `serve_summary.csv`: benchmark throughput, TTFT P99, TPOT P99, SLO status,
+  and goodput for every case.
+- `goodput_summary.csv`: best goodput under SLO for each mode/input/output
+  workload.
+- `npu_util_summary.csv`: optional P/D utilization balance from `npu-smi`
+  samples.
+- `pd_request_timeline_ms.csv`: per-request event timestamps and derived PD
+  durations.
+- `pull_transfer_summary.csv`: pull connector transfer latency summary.
+- `pd_trace_report.md`: a compact markdown report.
+
+By default the sample config uses `OUTPUT_LENS="32 128"` because the main
+evaluation is serve-level quality. Use `OUTPUT_LENS="1"` only as a diagnostic
+case when you want to isolate prefill plus PD handoff latency.
