@@ -70,11 +70,12 @@ write_case_event() {
   local output_len=$6
   local concurrency=$7
   local num_prompts=$8
+  local sleep_ms=$9
   local ts_ns
   ts_ns=$(date +%s%N)
 
-  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"%s","input_len":%s,"output_len":%s,"concurrency":%s,"num_prompts":%s}\n' \
-    "${ts_ns}" "${event}" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" \
+  printf '{"ts_ns":%s,"role":"bench","event":"%s","case_id":"%s","mode":"%s","sleep_ms":%s,"input_len":%s,"output_len":%s,"concurrency":%s,"num_prompts":%s}\n' \
+    "${ts_ns}" "${event}" "${case_id}" "${mode}" "${sleep_ms}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" \
     >> "${case_dir}/case.trace.jsonl"
 }
 
@@ -164,6 +165,7 @@ start_vllm_server() {
   local devices=$6
   local trace_file=$7
   local log_file=$8
+  local sleep_ms=$9
   local connector module_path extra_args
 
   if [[ "${mode}" == "pull" ]]; then
@@ -193,6 +195,7 @@ start_vllm_server() {
     export ASCEND_RT_VISIBLE_DEVICES="${devices}"
     export VLLM_ASCEND_PD_TRACE_PATH="${trace_file}"
     export VLLM_ASCEND_PD_TRACE_ROLE="${role}"
+    export VLLM_ASCEND_PD_TRANSFER_SLEEP_MS="${sleep_ms}"
     export HCCL_EXEC_TIMEOUT HCCL_CONNECT_TIMEOUT TASK_QUEUE_ENABLE VLLM_USE_V1
     export TRANSFORMERS_OFFLINE HF_HUB_OFFLINE
     vllm serve "${MODEL}" \
@@ -244,13 +247,14 @@ run_benchmark_case() {
   local input_len=$3
   local output_len=$4
   local concurrency=$5
+  local sleep_ms=$6
   local num_prompts=$((concurrency * NUM_FOLDS))
-  local case_id="${mode}-input-${input_len}-output-${output_len}-concurrency-${concurrency}"
-  local result_name="${mode}-input-${input_len}-output-${output_len}-concurrency-${concurrency}.json"
-  local bench_log="${case_dir}/bench-input-${input_len}-output-${output_len}-concurrency-${concurrency}.log"
+  local case_id="${mode}-sleep-${sleep_ms}-input-${input_len}-output-${output_len}-concurrency-${concurrency}"
+  local result_name="${case_id}.json"
+  local bench_log="${case_dir}/bench-sleep-${sleep_ms}-input-${input_len}-output-${output_len}-concurrency-${concurrency}.log"
 
-  echo "Benchmark ${mode}: input=${input_len}, output=${output_len}, concurrency=${concurrency}, prompts=${num_prompts}"
-  write_case_event "${case_dir}" "bench_case_start" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}"
+  echo "Benchmark ${mode}: sleep_ms=${sleep_ms}, input=${input_len}, output=${output_len}, concurrency=${concurrency}, prompts=${num_prompts}"
+  write_case_event "${case_dir}" "bench_case_start" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" "${sleep_ms}"
   vllm bench serve \
     --backend vllm \
     --model "${SERVED_MODEL_NAME}" \
@@ -267,18 +271,20 @@ run_benchmark_case() {
     --result-dir "${case_dir}" \
     --result-filename "${result_name}" \
     ${BENCH_EXTRA_ARGS} 2>&1 | tee "${bench_log}"
-  write_case_event "${case_dir}" "bench_case_end" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}"
+  write_case_event "${case_dir}" "bench_case_end" "${case_id}" "${mode}" "${input_len}" "${output_len}" "${concurrency}" "${num_prompts}" "${sleep_ms}"
 }
 
 run_mode() {
   local mode=$1
-  local mode_dir="${RUN_ROOT}/${mode}"
+  local sleep_ms=$2
+  local sleep_dir_name="${sleep_ms//./p}"
+  local mode_dir="${RUN_ROOT}/${mode}/sleep-${sleep_dir_name}"
   mkdir -p "${mode_dir}"
 
   start_vllm_server "${mode}" "prefill" "${PREFILL_PORT}" "${PREFILL_KV_PORT}" "0" \
-    "${PREFILL_DEVICES}" "${mode_dir}/prefill.trace.jsonl" "${mode_dir}/prefill.log"
+    "${PREFILL_DEVICES}" "${mode_dir}/prefill.trace.jsonl" "${mode_dir}/prefill.log" "${sleep_ms}"
   start_vllm_server "${mode}" "decode" "${DECODE_PORT}" "${DECODE_KV_PORT}" "1" \
-    "${DECODE_DEVICES}" "${mode_dir}/decode.trace.jsonl" "${mode_dir}/decode.log"
+    "${DECODE_DEVICES}" "${mode_dir}/decode.trace.jsonl" "${mode_dir}/decode.log" "${sleep_ms}"
   wait_for_server "${PREFILL_PORT}" "${mode}/prefill"
   wait_for_server "${DECODE_PORT}" "${mode}/decode"
 
@@ -290,7 +296,7 @@ run_mode() {
   for input_len in ${INPUT_LENS}; do
     for output_len in ${OUTPUT_LENS}; do
       for concurrency in ${CONCURRENCIES}; do
-        run_benchmark_case "${mode}" "${mode_dir}" "${input_len}" "${output_len}" "${concurrency}"
+        run_benchmark_case "${mode}" "${mode_dir}" "${input_len}" "${output_len}" "${concurrency}" "${sleep_ms}"
       done
     done
   done
@@ -301,7 +307,9 @@ run_mode() {
 
 echo "Results will be saved to ${RUN_ROOT}"
 for mode in ${MODES}; do
-  run_mode "${mode}"
+  for sleep_ms in ${TRANSFER_SLEEP_MS_LIST:-0}; do
+    run_mode "${mode}" "${sleep_ms}"
+  done
 done
 
 echo "Done. Parse traces with:"

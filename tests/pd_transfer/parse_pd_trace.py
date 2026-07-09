@@ -48,7 +48,8 @@ LAST_EVENTS = {
 REQUEST_ID_PREFIX_RE = re.compile(r"^cmpl-")
 REQUEST_ID_SUFFIX_RE = re.compile(r"-\d+$")
 BENCH_RESULT_RE = re.compile(
-    r"(?P<mode>pull|layerwise)-input-(?P<input_len>\d+)-output-"
+    r"(?P<mode>pull|layerwise)(?:-sleep-(?P<sleep_ms>\d+(?:\.\d+)?))?"
+    r"-input-(?P<input_len>\d+)-output-"
     r"(?P<output_len>\d+)-concurrency-(?P<concurrency>\d+)\.json$")
 
 
@@ -152,6 +153,8 @@ def parse_benchmark_results(root: Path, ttft_p99_slo_ms: float,
             path.stem,
             "mode":
             match.group("mode"),
+            "sleep_ms":
+            float(match.group("sleep_ms") or 0),
             "input_len":
             int(match.group("input_len")),
             "output_len":
@@ -210,7 +213,8 @@ def parse_benchmark_results(root: Path, ttft_p99_slo_ms: float,
             row["output_throughput"] if row["slo_met"] else 0.0)
         rows.append(row)
 
-    rows.sort(key=lambda row: (str(row["mode"]), int(row["input_len"]),
+    rows.sort(key=lambda row: (str(row["mode"]), float(row["sleep_ms"]),
+                               int(row["input_len"]),
                                int(row["output_len"]),
                                int(row["concurrency"])))
     return rows
@@ -219,7 +223,8 @@ def parse_benchmark_results(root: Path, ttft_p99_slo_ms: float,
 def summarize_goodput(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        grouped[(row["mode"], row["input_len"], row["output_len"])].append(row)
+        grouped[(row["mode"], row["sleep_ms"], row["input_len"],
+                 row["output_len"])].append(row)
 
     result = []
     for key, items in sorted(grouped.items()):
@@ -228,8 +233,9 @@ def summarize_goodput(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                                           or 0.0))
         result.append({
             "mode": key[0],
-            "input_len": key[1],
-            "output_len": key[2],
+            "sleep_ms": key[1],
+            "input_len": key[2],
+            "output_len": key[3],
             "best_concurrency": best["concurrency"],
             "slo_met": best["slo_met"],
             "goodput_output_throughput": best["goodput_output_throughput"],
@@ -237,6 +243,65 @@ def summarize_goodput(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "p99_ttft_ms": best["p99_ttft_ms"],
             "p99_tpot_ms": best["p99_tpot_ms"],
         })
+    return result
+
+
+def summarize_sleep_sensitivity(rows: list[dict[str, Any]]
+                                ) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["mode"], row["input_len"], row["output_len"],
+                 row["concurrency"])].append(row)
+
+    result = []
+    for key, items in sorted(grouped.items()):
+        baseline = next(
+            (item for item in items if float(item.get("sleep_ms", 0)) == 0),
+            None)
+        if baseline is None:
+            continue
+        base_ttft = as_float(baseline.get("p99_ttft_ms"))
+        base_tpot = as_float(baseline.get("p99_tpot_ms"))
+        base_goodput = as_float(baseline.get("goodput_output_throughput"))
+
+        for item in sorted(items, key=lambda row: float(row["sleep_ms"])):
+            sleep_ms = float(item["sleep_ms"])
+            ttft = as_float(item.get("p99_ttft_ms"))
+            tpot = as_float(item.get("p99_tpot_ms"))
+            goodput = as_float(item.get("goodput_output_throughput"))
+            delta_ttft = (round(ttft - base_ttft, 3)
+                          if ttft != "" and base_ttft != "" else "")
+            delta_tpot = (round(tpot - base_tpot, 3)
+                          if tpot != "" and base_tpot != "" else "")
+            delta_goodput = (round(goodput - base_goodput, 3)
+                             if goodput != "" and base_goodput != "" else "")
+            result.append({
+                "mode":
+                key[0],
+                "input_len":
+                key[1],
+                "output_len":
+                key[2],
+                "concurrency":
+                key[3],
+                "sleep_ms":
+                sleep_ms,
+                "p99_ttft_ms":
+                ttft,
+                "delta_p99_ttft_ms":
+                delta_ttft,
+                "ttft_delta_per_sleep_ms":
+                round(delta_ttft / sleep_ms, 4)
+                if sleep_ms > 0 and delta_ttft != "" else "",
+                "p99_tpot_ms":
+                tpot,
+                "delta_p99_tpot_ms":
+                delta_tpot,
+                "goodput_output_throughput":
+                goodput,
+                "delta_goodput_output_throughput":
+                delta_goodput,
+            })
     return result
 
 
@@ -256,6 +321,8 @@ def find_cases(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cases.append({
                 "case_id": str(case_id),
                 "mode": record.get("mode", start.get("mode", "")),
+                "sleep_ms": float(record.get("sleep_ms",
+                                             start.get("sleep_ms", 0))),
                 "input_len": int(record.get("input_len", start.get("input_len", 0))),
                 "output_len": int(record.get("output_len", start.get("output_len", 0))),
                 "concurrency": int(record.get("concurrency", start.get("concurrency", 0))),
@@ -294,6 +361,7 @@ def build_request_rows(records: list[dict[str, Any]],
             if case is not None:
                 row.setdefault("case_id", case["case_id"])
                 row.setdefault("mode", case["mode"])
+                row.setdefault("sleep_ms", case["sleep_ms"])
                 row.setdefault("input_len", case["input_len"])
                 row.setdefault("output_len", case["output_len"])
                 row.setdefault("concurrency", case["concurrency"])
@@ -361,6 +429,7 @@ def aggregate_pull(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         key = (
             row.get("case_id", "unknown"),
             row.get("mode", "pull"),
+            row.get("sleep_ms", 0),
             row.get("input_len", ""),
             row.get("output_len", ""),
             row.get("concurrency", ""),
@@ -398,9 +467,10 @@ def aggregate_pull(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         result.append({
             "case_id": key[0],
             "mode": key[1],
-            "input_len": key[2],
-            "output_len": key[3],
-            "concurrency": key[4],
+            "sleep_ms": key[2],
+            "input_len": key[3],
+            "output_len": key[4],
+            "concurrency": key[5],
             "request_count": len(values),
             "transfer_mean_ms": round(statistics.mean(values), 3),
             "transfer_median_ms": round(statistics.median(values), 3),
@@ -439,17 +509,17 @@ def aggregate_npu_util(records: list[dict[str, Any]],
             continue
         role = str(record.get("role", ""))
         device = str(record.get("device", ""))
-        grouped[(case["case_id"], case["mode"], case["input_len"],
-                 case["output_len"], case["concurrency"], role,
+        grouped[(case["case_id"], case["mode"], case["sleep_ms"],
+                 case["input_len"], case["output_len"], case["concurrency"], role,
                  device)].append(float(util))
 
     by_case_role: dict[tuple[Any, ...], list[float]] = defaultdict(list)
     for key, values in grouped.items():
-        case_key = key[:5]
-        role = key[5]
+        case_key = key[:6]
+        role = key[6]
         by_case_role[(*case_key, role)].extend(values)
 
-    case_keys = sorted({key[:5] for key in by_case_role})
+    case_keys = sorted({key[:6] for key in by_case_role})
     result = []
     for case_key in case_keys:
         prefill_values = by_case_role.get((*case_key, "prefill_util"), [])
@@ -469,9 +539,10 @@ def aggregate_npu_util(records: list[dict[str, Any]],
         result.append({
             "case_id": case_key[0],
             "mode": case_key[1],
-            "input_len": case_key[2],
-            "output_len": case_key[3],
-            "concurrency": case_key[4],
+            "sleep_ms": case_key[2],
+            "input_len": case_key[3],
+            "output_len": case_key[4],
+            "concurrency": case_key[5],
             "prefill_util_mean": prefill_mean,
             "decode_util_mean": decode_mean,
             "util_balance_gap": balance_gap,
@@ -492,18 +563,20 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None
 def write_markdown(path: Path, pull_rows: list[dict[str, Any]],
                    serve_rows: list[dict[str, Any]],
                    goodput_rows: list[dict[str, Any]],
-                   util_rows: list[dict[str, Any]]) -> None:
+                   util_rows: list[dict[str, Any]],
+                   sensitivity_rows: list[dict[str, Any]]) -> None:
     lines = ["# PD Transfer Trace Report", ""]
     if serve_rows:
         lines.extend([
             "## Serve-Level Metrics",
             "",
-            "| case | req/s | output tok/s | TTFT P99 ms | TPOT P99 ms | SLO met | goodput output tok/s |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| case | sleep ms | req/s | output tok/s | TTFT P99 ms | TPOT P99 ms | SLO met | goodput output tok/s |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
         ])
         for row in serve_rows:
             lines.append(
-                f"| {row['case_id']} | {row['request_throughput']} | "
+                f"| {row['case_id']} | {row['sleep_ms']} | "
+                f"{row['request_throughput']} | "
                 f"{row['output_throughput']} | {row['p99_ttft_ms']} | "
                 f"{row['p99_tpot_ms']} | {row['slo_met']} | "
                 f"{row['goodput_output_throughput']} |")
@@ -513,27 +586,45 @@ def write_markdown(path: Path, pull_rows: list[dict[str, Any]],
         lines.extend([
             "## Best Goodput Under SLO",
             "",
-            "| mode | input | output | best concurrency | goodput output tok/s | TTFT P99 ms | TPOT P99 ms |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| mode | sleep ms | input | output | best concurrency | goodput output tok/s | TTFT P99 ms | TPOT P99 ms |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
         ])
         for row in goodput_rows:
             lines.append(
-                f"| {row['mode']} | {row['input_len']} | "
+                f"| {row['mode']} | {row['sleep_ms']} | {row['input_len']} | "
                 f"{row['output_len']} | {row['best_concurrency']} | "
                 f"{row['goodput_output_throughput']} | "
                 f"{row['p99_ttft_ms']} | {row['p99_tpot_ms']} |")
+        lines.append("")
+
+    if sensitivity_rows:
+        lines.extend([
+            "## Sleep Sensitivity",
+            "",
+            "| mode | input | output | sleep ms | delta TTFT P99 ms | TTFT delta / sleep | delta TPOT P99 ms | delta goodput output tok/s |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for row in sensitivity_rows:
+            lines.append(
+                f"| {row['mode']} | {row['input_len']} | "
+                f"{row['output_len']} | {row['sleep_ms']} | "
+                f"{row['delta_p99_ttft_ms']} | "
+                f"{row['ttft_delta_per_sleep_ms']} | "
+                f"{row['delta_p99_tpot_ms']} | "
+                f"{row['delta_goodput_output_throughput']} |")
         lines.append("")
 
     if util_rows:
         lines.extend([
             "## P/D Utilization Balance",
             "",
-            "| case | P util mean | D util mean | abs gap | D/P ratio |",
-            "|---|---:|---:|---:|---:|",
+            "| case | sleep ms | P util mean | D util mean | abs gap | D/P ratio |",
+            "|---|---:|---:|---:|---:|---:|",
         ])
         for row in util_rows:
             lines.append(
-                f"| {row['case_id']} | {row['prefill_util_mean']} | "
+                f"| {row['case_id']} | {row['sleep_ms']} | "
+                f"{row['prefill_util_mean']} | "
                 f"{row['decode_util_mean']} | {row['util_balance_gap']} | "
                 f"{row['decode_to_prefill_util_ratio']} |")
         lines.append("")
@@ -549,12 +640,13 @@ def write_markdown(path: Path, pull_rows: list[dict[str, Any]],
         lines.extend([
             "## Pull Transfer Latency",
             "",
-            "| case | input | output | concurrency | requests | pure transfer mean ms | prefill->decode request mean ms | prefill->transfer start mean ms | prefill->transfer end mean ms |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| case | sleep ms | input | output | concurrency | requests | pure transfer mean ms | prefill->decode request mean ms | prefill->transfer start mean ms | prefill->transfer end mean ms |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
         for row in pull_rows:
             lines.append(
-                f"| {row['case_id']} | {row['input_len']} | {row['output_len']} | "
+                f"| {row['case_id']} | {row['sleep_ms']} | "
+                f"{row['input_len']} | {row['output_len']} | "
                 f"{row['concurrency']} | {row['request_count']} | "
                 f"{row['transfer_mean_ms']} | "
                 f"{row['prefill_to_decode_request_added_mean_ms']} | "
@@ -582,10 +674,11 @@ def main() -> None:
     serve_rows = parse_benchmark_results(args.run_root, args.ttft_p99_slo_ms,
                                          args.tpot_p99_slo_ms)
     goodput_rows = summarize_goodput(serve_rows)
+    sensitivity_rows = summarize_sleep_sensitivity(serve_rows)
     util_rows = aggregate_npu_util(records, cases)
 
     request_fields = [
-        "case_id", "mode", "input_len", "output_len", "concurrency",
+        "case_id", "mode", "sleep_ms", "input_len", "output_len", "concurrency",
         "request_id", "ttft_trace_ms", "pull_transfer_elapsed_ms",
         "pull_transfer_wall_ms", "pull_transfer_end_minus_start_ms",
         "pull_prefill_to_proxy_decode_start_ms",
@@ -596,7 +689,7 @@ def main() -> None:
         "layerwise_visible_tail_ms", "layerwise_transfer_bytes_sum",
     ]
     pull_fields = [
-        "case_id", "mode", "input_len", "output_len", "concurrency",
+        "case_id", "mode", "sleep_ms", "input_len", "output_len", "concurrency",
         "request_count", "transfer_mean_ms", "transfer_median_ms",
         "transfer_p90_ms", "transfer_p99_ms", "transfer_min_ms",
         "transfer_max_ms", "transfer_wall_mean_ms",
@@ -605,7 +698,7 @@ def main() -> None:
         "prefill_to_transfer_start_mean_ms", "visible_tail_mean_ms",
     ]
     serve_fields = [
-        "case_id", "mode", "input_len", "output_len", "concurrency",
+        "case_id", "mode", "sleep_ms", "input_len", "output_len", "concurrency",
         "completed", "request_throughput", "input_throughput",
         "output_throughput", "total_token_throughput", "mean_ttft_ms",
         "median_ttft_ms", "p99_ttft_ms", "mean_tpot_ms",
@@ -616,15 +709,21 @@ def main() -> None:
         "result_file",
     ]
     goodput_fields = [
-        "mode", "input_len", "output_len", "best_concurrency", "slo_met",
-        "goodput_output_throughput", "goodput_request_throughput",
-        "p99_ttft_ms", "p99_tpot_ms",
+        "mode", "sleep_ms", "input_len", "output_len", "best_concurrency",
+        "slo_met", "goodput_output_throughput",
+        "goodput_request_throughput", "p99_ttft_ms", "p99_tpot_ms",
     ]
     util_fields = [
-        "case_id", "mode", "input_len", "output_len", "concurrency",
+        "case_id", "mode", "sleep_ms", "input_len", "output_len", "concurrency",
         "prefill_util_mean", "decode_util_mean", "util_balance_gap",
         "decode_to_prefill_util_ratio", "prefill_sample_count",
         "decode_sample_count",
+    ]
+    sensitivity_fields = [
+        "mode", "input_len", "output_len", "concurrency", "sleep_ms",
+        "p99_ttft_ms", "delta_p99_ttft_ms", "ttft_delta_per_sleep_ms",
+        "p99_tpot_ms", "delta_p99_tpot_ms", "goodput_output_throughput",
+        "delta_goodput_output_throughput",
     ]
 
     request_csv = args.run_root / "pd_request_timeline_ms.csv"
@@ -632,6 +731,7 @@ def main() -> None:
     serve_csv = args.run_root / "serve_summary.csv"
     goodput_csv = args.run_root / "goodput_summary.csv"
     util_csv = args.run_root / "npu_util_summary.csv"
+    sensitivity_csv = args.run_root / "sleep_sensitivity_summary.csv"
     report_md = args.run_root / "pd_trace_report.md"
 
     write_csv(request_csv, request_rows, request_fields)
@@ -639,13 +739,16 @@ def main() -> None:
     write_csv(serve_csv, serve_rows, serve_fields)
     write_csv(goodput_csv, goodput_rows, goodput_fields)
     write_csv(util_csv, util_rows, util_fields)
-    write_markdown(report_md, pull_rows, serve_rows, goodput_rows, util_rows)
+    write_csv(sensitivity_csv, sensitivity_rows, sensitivity_fields)
+    write_markdown(report_md, pull_rows, serve_rows, goodput_rows, util_rows,
+                   sensitivity_rows)
 
     print(f"Wrote request timeline: {request_csv}")
     print(f"Wrote pull transfer summary: {pull_csv}")
     print(f"Wrote serve summary: {serve_csv}")
     print(f"Wrote goodput summary: {goodput_csv}")
     print(f"Wrote NPU utilization summary: {util_csv}")
+    print(f"Wrote sleep sensitivity summary: {sensitivity_csv}")
     print(f"Wrote markdown report: {report_md}")
     if not cases:
         print("No bench_case_start/end markers found; per-case grouping is only "

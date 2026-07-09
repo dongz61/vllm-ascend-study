@@ -54,6 +54,17 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+PD_TRANSFER_SLEEP_ENV = "VLLM_ASCEND_PD_TRANSFER_SLEEP_MS"
+
+
+def get_pd_transfer_sleep_ms() -> float:
+    value = os.getenv(PD_TRANSFER_SLEEP_ENV, "0")
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        logger.warning("Invalid %s=%r, ignoring transfer sleep.",
+                       PD_TRANSFER_SLEEP_ENV, value)
+        return 0.0
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -599,6 +610,18 @@ class KVCacheRecvingThread(threading.Thread):
                          req_meta["request_id"])
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
+        transfer_sleep_ms = get_pd_transfer_sleep_ms()
+        if transfer_sleep_ms > 0:
+            trace_event("pull_transfer_sleep_start",
+                        request_id,
+                        role="decode",
+                        sleep_ms=transfer_sleep_ms)
+            time.sleep(transfer_sleep_ms / 1000)
+            trace_event("pull_transfer_sleep_end",
+                        request_id,
+                        role="decode",
+                        sleep_ms=transfer_sleep_ms)
+
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
         trace_event("pull_transfer_end",
@@ -612,6 +635,7 @@ class KVCacheRecvingThread(threading.Thread):
                     num_blocks=num_blocks,
                     num_ops=len(length_list),
                     total_bytes=sum(length_list),
+                    injected_sleep_ms=transfer_sleep_ms,
                     ret=ret)
         logger.info(
             "KV cache transfer for request %s took %.2f ms (%d groups,"

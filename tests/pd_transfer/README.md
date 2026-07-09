@@ -3,13 +3,13 @@
 This directory contains lightweight scripts for measuring PD KV-transfer
 timelines in a Linux NPU environment.
 
-The first version targets a 1P1D setup:
+The default experiment targets a 1P1D, single-concurrency setup:
 
 1. Start one prefiller server.
 2. Start one decoder server.
 3. Start the matching PD proxy.
-4. Run random-input serving benchmarks for selected input/output lengths and
-   concurrency levels.
+4. Run random-input serving benchmarks for selected input lengths and injected
+   transfer-delay levels.
 5. Save vLLM benchmark JSON, process logs, PD trace JSONL files, and optional
    NPU utilization samples.
 
@@ -44,6 +44,9 @@ The parser produces:
   and goodput for every case.
 - `goodput_summary.csv`: best goodput under SLO for each mode/input/output
   workload.
+- `sleep_sensitivity_summary.csv`: metric deltas relative to `sleep_ms=0`,
+  useful for comparing whether transfer-delay impact is similar across input
+  lengths.
 - `npu_util_summary.csv`: optional P/D utilization balance from `npu-smi`
   samples.
 - `pd_request_timeline_ms.csv`: per-request event timestamps and derived PD
@@ -51,6 +54,12 @@ The parser produces:
 - `pull_transfer_summary.csv`: pull connector transfer latency summary.
 - `pd_trace_report.md`: a compact markdown report.
 
-By default the sample config uses `OUTPUT_LENS="32 128"` because the main
-evaluation is serve-level quality. Use `OUTPUT_LENS="1"` only as a diagnostic
-case when you want to isolate prefill plus PD handoff latency.
+By default the sample config uses `CONCURRENCIES="1"` and
+`TRANSFER_SLEEP_MS_LIST="0 5 10 20 50 100"`. The pull connector reads
+`VLLM_ASCEND_PD_TRANSFER_SLEEP_MS` and injects that delay into the measured
+transfer path. The script restarts the P/D/proxy processes for each sleep value
+so every case has a stable setting.
+
+The default `OUTPUT_LENS="32"` keeps TPOT meaningful while avoiding a large
+decode-heavy sweep. Use `OUTPUT_LENS="1"` only as a diagnostic case when you
+want to isolate prefill plus PD handoff latency.
